@@ -721,19 +721,18 @@ class TestDCGMSnapExporter(unittest.TestCase):
     def setUp(self) -> None:
         """Set up harness for each test case."""
         snap_lib_patcher = mock.patch.object(service, "snap")
-        shutil_lib_patcher = mock.patch.object(service, "shutil")
+
         self.mock_snap = snap_lib_patcher.start()
-        self.mock_shutil = shutil_lib_patcher.start()
         self.addCleanup(snap_lib_patcher.stop)
-        self.addCleanup(shutil_lib_patcher.stop)
 
-        search_path = pathlib.Path(f"{__file__}/../../..").resolve()
-        self.mock_config = {
-            "dcgm-snap-channel": "latest/stable",
-        }
-
-        self.exporter = service.DCGMExporter(search_path, self.mock_config)
-        self.exporter.strategy = mock.MagicMock()
+        self.exporter = service.DCGMExporter(
+            {
+                "dcgm-snap-channel": "latest/stable",
+            }
+        )
+        self.snap_strategy = mock.MagicMock(spec=service.DCGMExporterStrategy)
+        self.nvidia_strategy = mock.MagicMock(spec=service.NVIDIADriverStrategy)
+        self.exporter.strategies = [self.snap_strategy, self.nvidia_strategy]
 
     def test_exporter_name(self):
         self.assertEqual(self.exporter.exporter_name, "dcgm")
@@ -741,39 +740,26 @@ class TestDCGMSnapExporter(unittest.TestCase):
     def test_hw_tools(self):
         self.assertEqual(self.exporter.hw_tools(), {HWTool.DCGM})
 
-    def test_install_failed(self):
-        self.exporter.snap_client.present = False
+    @mock.patch("service.NVIDIADriverStrategy.check", return_value=True)
+    def test_validate_exporter_configs_success(self, _):
+        valid, msg = self.exporter.validate_exporter_configs()
+        self.assertTrue(valid)
+        self.assertEqual(msg, "Exporter config is valid.")
 
-        exporter_install_ok = self.exporter.install()
-
-        self.exporter.strategy.install.assert_called()
-        self.mock_shutil.copy.assert_not_called()
-        self.assertFalse(exporter_install_ok)
-
-    def test_install_success(self):
-        self.exporter.snap_client.present = True
-
-        exporter_install_ok = self.exporter.install()
-
-        self.exporter.strategy.install.assert_called()
-        self.mock_shutil.copy.assert_called_with(
-            self.exporter.metrics_file, self.exporter.snap_common
+    @mock.patch("service.NVIDIADriverStrategy.check", return_value=False)
+    def test_validate_exporter_configs_fails(self, _):
+        valid, msg = self.exporter.validate_exporter_configs()
+        self.assertFalse(valid)
+        self.assertEqual(
+            msg, "Failed to communicate with NVIDIA driver. See more details in the logs"
         )
-        self.exporter.snap_client.set.assert_called_with(
-            {self.exporter.metric_config: self.exporter.metric_config_value}
-        )
-        self.exporter.snap_client.restart.assert_called_with(reload=True)
-        self.assertTrue(exporter_install_ok)
 
-    def test_install_metrics_copy_fail(self):
-        self.exporter.snap_client.present = True
-        self.mock_shutil.copy.side_effect = FileNotFoundError
-
-        exporter_install_ok = self.exporter.install()
-
-        self.exporter.strategy.install.assert_called()
-        self.exporter.snap_client.restart.assert_not_called()
-        self.assertFalse(exporter_install_ok)
+    @mock.patch.object(service.BaseExporter, "validate_exporter_configs")
+    def test_validate_exporter_configs_fails_parent(self, mock_parent_validate):
+        mock_parent_validate.return_value = False, "Invalid config: exporter's port"
+        valid, msg = self.exporter.validate_exporter_configs()
+        self.assertFalse(valid)
+        self.assertEqual(msg, "Invalid config: exporter's port")
 
 
 class TestWriteToFile(unittest.TestCase):
@@ -797,22 +783,56 @@ class TestWriteToFile(unittest.TestCase):
 
         mock_open.assert_called_with(path, "w", encoding="utf-8")
         mock_file.write.assert_called_with(content)
+        mock_os.chmod.assert_not_called()
 
-    @mock.patch("service.os.open", new_callable=mock.mock_open)
-    @mock.patch("service.os.fdopen", new_callable=mock.mock_open)
+    def test_write_file_already_exist_changes_permission(self):
+        path = pathlib.Path(self.temp_file.name)
+        prior_permission = path.stat().st_mode & 0o777
+        new_permission = 0o666
+        self.assertNotEqual(prior_permission, new_permission)
+
+        service.write_to_file(path, "", new_permission)
+
+        after_permission = path.stat().st_mode & 0o777
+        self.assertEqual(after_permission, new_permission)
+
+    def test_write_file_changes_content(self):
+        path = pathlib.Path(self.temp_file.name)
+        content_before = (
+            "port: 10200\nlevel: DEBUG\ncollect_timeout: 60\n\nenable_collectors:\n  \n  "
+            "- collector.poweredge_raid\n  \n  - collector.ipmi_dcmi\n  \n  "
+            "- collector.ipmi_sensor\n  \n  - collector.ipmi_sel\n\n  - collector.redfish\n  "
+            "\n\nredfish_host: 'https://10.229.2.8'\nredfish_username: 'root'\n"
+            "redfish_password: '<redacted>'\nredfish_client_timeout: '60'\n"
+        )
+        with open(path, "w", encoding="utf-8") as file:
+            file.write(content_before)
+
+        # simulate the redfish disable option
+        content_after = (
+            "port: 10200\nlevel: DEBUG\ncollect_timeout: 60\n\nenable_collectors:\n  \n"
+            "  - collector.poweredge_raid\n  \n  - collector.ipmi_dcmi\n  "
+            "\n  - collector.ipmi_sensor\n  \n  - collector.ipmi_sel\n"
+        )
+
+        service.write_to_file(path, content_after)
+
+        self.assertEqual(path.read_text(), content_after)
+
+    @mock.patch("builtins.open", new_callable=mock.mock_open)
     @mock.patch("service.os")
-    def test_write_to_file_with_mode_success(self, mock_os, mock_fdopen, mock_open):
+    def test_write_to_file_with_mode_success(self, mock_os, mock_open):
         path = pathlib.Path(self.temp_file.name)
         content = "Hello, world!"
 
-        mock_file = mock_fdopen.return_value.__enter__.return_value
+        mock_file = mock_open.return_value.__enter__.return_value
 
         result = service.write_to_file(path, content, mode=0o600)
         self.assertTrue(result)
 
-        mock_open.assert_called_with(path, mock_os.O_CREAT | mock_os.O_WRONLY, 0o600)
-        mock_fdopen.assert_called_with(mock_open.return_value, "w", encoding="utf-8")
+        mock_open.assert_called_with(path, "w", encoding="utf-8")
         mock_file.write.assert_called_with(content)
+        mock_os.chmod.assert_called_with(path, 0o600)
 
     @mock.patch("builtins.open", new_callable=mock.mock_open)
     def test_write_to_file_permission_error(self, mock_open):
@@ -845,25 +865,27 @@ class TestWriteToFile(unittest.TestCase):
 
 @pytest.fixture
 def snap_exporter():
-    my_strategy = mock.MagicMock(spec=service.SnapStrategy)
+    my_snap_strategy = mock.MagicMock(spec=service.SnapStrategy)
+    my_apt_strategy = mock.MagicMock(spec=service.APTStrategyABC)
 
     class MySnapExporter(service.SnapExporter):
         exporter_name = "my-exporter"
         channel = "my-channel"
-        strategy = my_strategy
-
-    mock_config = {
-        "dcgm-snap-channel": "latest/stable",
-    }
+        strategies = [my_snap_strategy, my_apt_strategy]
 
     with mock.patch("service.snap.SnapCache"):
-        exporter = MySnapExporter(mock_config)
+        exporter = MySnapExporter(
+            {
+                "dcgm-snap-channel": "latest/stable",
+            }
+        )
 
         exporter.snap_client.services = {"service1": {}, "service2": {}}
 
         yield exporter
 
-        my_strategy.reset_mock()
+        my_snap_strategy.reset_mock()
+        my_apt_strategy.reset_mock()
 
 
 def test_snap_exporter_hw_tools(snap_exporter):
@@ -871,16 +893,16 @@ def test_snap_exporter_hw_tools(snap_exporter):
     assert snap_exporter.hw_tools() == set()
 
 
-def test_snap_exporter_install(snap_exporter):
-    snap_exporter.strategy.install.return_value = True
+def test_snap_exporter_install_success(snap_exporter):
     snap_exporter.snap_client.present = True
 
     assert snap_exporter.install() is True
-    snap_exporter.strategy.install.assert_called_once()
+    for strategy in snap_exporter.strategies:
+        strategy.install.assert_called_once()
 
 
 def test_snap_exporter_install_fail(snap_exporter):
-    snap_exporter.strategy.install.side_effect = ValueError
+    snap_exporter.strategies[0].install.side_effect = ValueError
 
     assert snap_exporter.install() is False
 
@@ -889,11 +911,12 @@ def test_snap_exporter_uninstall(snap_exporter):
     snap_exporter.snap_client.present = False
 
     assert snap_exporter.uninstall() is True
-    snap_exporter.strategy.remove.assert_called_once()
+    for strategy in snap_exporter.strategies:
+        strategy.remove.assert_called_once()
 
 
 def test_snap_exporter_uninstall_fail(snap_exporter):
-    snap_exporter.strategy.remove.side_effect = ValueError
+    snap_exporter.strategies[0].remove.side_effect = ValueError
 
     assert snap_exporter.uninstall() is False
 
@@ -902,7 +925,8 @@ def test_snap_exporter_uninstall_present(snap_exporter):
     snap_exporter.snap_client.present = True
 
     assert snap_exporter.uninstall() is False
-    snap_exporter.strategy.remove.assert_called_once()
+    for strategy in snap_exporter.strategies:
+        strategy.remove.assert_called_once()
 
 
 def test_snap_exporter_enable_and_start(snap_exporter):
@@ -935,20 +959,25 @@ def test_snap_exporter_set_failed(snap_exporter):
 
 def test_snap_exporter_check_health(snap_exporter):
     snap_exporter.check_health()
-    snap_exporter.strategy.check.assert_called_once()
+    for strategy in snap_exporter.strategies:
+        strategy.check.assert_called_once()
 
 
-@pytest.mark.parametrize("install_result, expected_result", [(True, True), (False, False)])
-@mock.patch("service.SnapExporter.install")
-def test_snap_exporter_configure(mock_install, snap_exporter, install_result, expected_result):
-    mock_install.return_value = install_result
+@mock.patch("service.isinstance", return_value=True)
+def test_snap_exporter_configure(_, snap_exporter):
+    assert snap_exporter.configure() is True
+    for strategy in snap_exporter.strategies:
+        strategy.install.assert_called_once()
 
-    assert snap_exporter.configure() is expected_result
-    mock_install.assert_called_once()
+
+@mock.patch("service.isinstance", return_value=True)
+def test_snap_exporter_configure_exception(_, snap_exporter):
+    snap_exporter.strategies[0].install.side_effect = snap.SnapError
+    assert snap_exporter.configure() is False
 
 
 @pytest.mark.parametrize("result, expected_result", [(True, True), (False, False)])
-@mock.patch("service.SnapExporter.install")
+@mock.patch("service.SmartCtlExporterStrategy.install")
 @mock.patch("service.SnapExporter.set")
 def test_smartctl_exporter_configure(mock_set, mock_install, result, expected_result):
     mock_config = {
@@ -956,7 +985,6 @@ def test_smartctl_exporter_configure(mock_set, mock_install, result, expected_re
         "exporter-log-level": "info",
         "smartctl-exporter-snap-channel": "latest/stable",
     }
-
     mock_set.return_value = result
     mock_install.return_value = result
     exporter = service.SmartCtlExporter(mock_config)
